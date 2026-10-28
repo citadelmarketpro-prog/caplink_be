@@ -35,7 +35,7 @@ class UserManager(DjangoUserManager):
 
 class User(AbstractUser):
     """
-    Extended user model for CaplinkTrades.
+    Extended user model for CaplinkMarkets.
     Email-only — there is no username field.
     """
     username = None

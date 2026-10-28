@@ -168,8 +168,8 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://111.90.143.34",
-    "https://caplinktrade.com",
-    "https://www.caplinktrade.com",
+    "https://caplinkmarkets.com",
+    "https://www.caplinkmarkets.com",
 ]
 CORS_ALLOW_CREDENTIALS = True   # required so the browser sends cookies cross-origin
 
@@ -181,8 +181,8 @@ CSRF_TRUSTED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://111.90.143.34",
-    "https://caplinktrade.com",
-    "https://www.caplinktrade.com",
+    "https://caplinkmarkets.com",
+    "https://www.caplinkmarkets.com",
 ]
 
 CSRF_COOKIE_SECURE    = not DEBUG

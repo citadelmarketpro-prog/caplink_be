@@ -99,20 +99,19 @@ APPEND_SLASH = False
 DATABASES = {
     'default': dj_database_url.config(
         default=config('DATABASE_URL', default=f'sqlite:///{BASE_DIR / "db.sqlite3"}'),
-        # DATABASE_URL now points at Supabase's Supavisor pooler in *session*
-        # mode, which dedicates one real Postgres backend per client and caps
-        # the total at 15 (EMAXCONNSESSION). That pooling model is meant for a
-        # small number of long-lived clients, not many short-lived ones — the
-        # opposite of Neon's pooler, which this conn_max_age was originally
-        # tuned for. Reusing connections for 600s per thread let Django's
-        # threaded dev server (and any concurrent workers) accumulate more
-        # held connections than the pool allows. conn_max_age=0 closes the
-        # connection at the end of every request instead, so nothing lingers
-        # against the 15-client cap. If persistent connections are wanted
-        # later, point DATABASE_URL at Supabase's *transaction*-mode pooler
-        # (port 6543) instead of raising this back up against session mode.
+        # DATABASE_URL points at Supabase's Supavisor pooler in *transaction*
+        # mode (port 6543), which multiplexes many short-lived app connections
+        # over a small pool of real Postgres backends. Transaction-mode pgbouncer
+        # does not support server-side (named) cursors — a statement can be
+        # routed to a different backend connection mid-cursor — so Django's
+        # queryset .iterator()/chunked reads must not use them here.
+        # disable_server_side_cursors=True makes Django always fetch results
+        # in a single round trip instead, which is required for correctness
+        # under this pooling mode. conn_max_age=0 closes the connection at the
+        # end of every request since pgbouncer already handles pooling upstream.
         conn_max_age=0,
         conn_health_checks=True,
+        disable_server_side_cursors=True,
     )
 }
 

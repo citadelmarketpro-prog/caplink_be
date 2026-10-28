@@ -1,0 +1,1791 @@
+import types as _types
+from datetime import timedelta
+
+from django.conf import settings
+from django.contrib.auth import authenticate, get_user_model
+from django.contrib.auth.tokens import default_token_generator
+from django.utils import timezone
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
+from rest_framework import status
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
+
+from .authentication import CookieJWTAuthentication
+from .email_service import (
+    generate_verification_code,
+    is_code_valid,
+    send_2fa_code_email,
+    send_admin_deposit_notification,
+    send_admin_payment_intent_notification,
+    send_admin_withdrawal_intent_notification,
+    send_admin_withdrawal_notification,
+    send_password_changed_email,
+    send_password_reset_email,
+    send_user_withdrawal_confirmation,
+    send_welcome_email,
+)
+from .models import (
+    AdminWallet,
+    CopyRelationship,
+    CopyTrade,
+    DepositIntent,
+    Notification,
+    Trader,
+    Transaction,
+    SavedPaymentMethod,
+)
+from .serializers import (
+    AdminWalletSerializer,
+    ChangePasswordSerializer,
+    CopyingTraderSerializer,
+    CopyTradeSerializer,
+    DepositSerializer,
+    ForgotPasswordSerializer,
+    KycSerializer,
+    LoginSerializer,
+    NotificationSerializer,
+    RegisterSerializer,
+    ResetPasswordSerializer,
+    SavedPaymentMethodSerializer,
+    StockPositionSerializer,
+    TraderDetailSerializer,
+    TraderSerializer,
+    TransactionSerializer,
+    UpdateProfileSerializer,
+    UserProfileSerializer,
+    WithdrawalSerializer,
+)
+
+User = get_user_model()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cookie helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+from decouple import config as _env_config
+
+COOKIE_SECURE   = _env_config("COOKIE_SECURE",   default=not settings.DEBUG, cast=bool)
+COOKIE_SAMESITE = _env_config("COOKIE_SAMESITE", default="Lax")
+ACCESS_MAX_AGE  = 60 * 60                     # 1 hour
+REFRESH_MAX_AGE = 60 * 60 * 24 * 7           # 7 days
+
+
+def _set_auth_cookies(response: Response, refresh: RefreshToken) -> None:
+    """Write access + refresh tokens into HTTP-only cookies."""
+    response.set_cookie(
+        key="access_token",
+        value=str(refresh.access_token),
+        max_age=ACCESS_MAX_AGE,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
+        path="/",
+    )
+    response.set_cookie(
+        key="refresh_token",
+        value=str(refresh),
+        max_age=REFRESH_MAX_AGE,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
+        path="/",
+    )
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie("access_token",  path="/")
+    response.delete_cookie("refresh_token", path="/")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auth views
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RegisterView(APIView):
+    """POST /api/auth/register/"""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = RegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+
+        refresh  = RefreshToken.for_user(user)
+        try:
+            send_welcome_email(user)
+        except Exception:
+            pass
+        response = Response(
+            {"detail": "Account created successfully."},
+            status=status.HTTP_201_CREATED,
+        )
+        _set_auth_cookies(response, refresh)
+        return response
+
+
+class LoginView(APIView):
+    """POST /api/auth/login/"""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = LoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user = authenticate(
+            request,
+            email=serializer.validated_data["email"],
+            password=serializer.validated_data["password"],
+        )
+        if user is None:
+            return Response(
+                {"detail": "Invalid email or password."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        if not user.is_active:
+            return Response(
+                {"detail": "This account has been disabled."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if user.two_factor_enabled:
+            code = generate_verification_code()
+            user.verification_code = code
+            user.code_created_at   = timezone.now()
+            user.save(update_fields=["verification_code", "code_created_at"])
+
+            if not send_2fa_code_email(user, code):
+                return Response(
+                    {"detail": "Failed to send verification code. Please try again."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+            return Response(
+                {"requires_2fa": True, "email": user.email},
+                status=status.HTTP_200_OK,
+            )
+
+        refresh  = RefreshToken.for_user(user)
+        response = Response({"detail": "Login successful."})
+        _set_auth_cookies(response, refresh)
+        return response
+
+
+class Verify2FALoginView(APIView):
+    """POST /api/auth/2fa/verify/ — Body: { email, code }
+
+    Completes a login that was paused by LoginView because the account has
+    2FA enabled. Only on success are the auth cookies actually set."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = (request.data.get("email") or "").strip()
+        code  = (request.data.get("code") or "").strip()
+
+        if not email or not code:
+            return Response(
+                {"detail": "Email and verification code are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not user.verification_code or not is_code_valid(user):
+            return Response(
+                {"detail": "Verification code has expired. Please log in again."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if user.verification_code != code:
+            return Response(
+                {"detail": "Invalid verification code."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user.verification_code = None
+        user.code_created_at   = None
+        user.save(update_fields=["verification_code", "code_created_at"])
+
+        refresh  = RefreshToken.for_user(user)
+        response = Response({"detail": "Login successful."})
+        _set_auth_cookies(response, refresh)
+        return response
+
+
+class Resend2FACodeView(APIView):
+    """POST /api/auth/2fa/resend/ — Body: { email }
+
+    Unauthenticated (the user hasn't completed login yet at this point)."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = (request.data.get("email") or "").strip()
+        if not email:
+            return Response({"detail": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not user.two_factor_enabled:
+            return Response(
+                {"detail": "2FA is not enabled for this account."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if user.code_created_at and timezone.now() - user.code_created_at < timedelta(minutes=1):
+            return Response(
+                {"detail": "Please wait at least 1 minute before requesting a new code."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        code = generate_verification_code()
+        user.verification_code = code
+        user.code_created_at   = timezone.now()
+        user.save(update_fields=["verification_code", "code_created_at"])
+
+        if not send_2fa_code_email(user, code):
+            return Response(
+                {"detail": "Failed to send verification code. Please try again."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        return Response({"detail": "Verification code sent."})
+
+
+class Enable2FAView(APIView):
+    """POST /api/auth/2fa/enable/ — no password required to turn it on."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        if not user.two_factor_enabled:
+            user.two_factor_enabled = True
+            user.save(update_fields=["two_factor_enabled"])
+        return Response({"two_factor_enabled": True})
+
+
+class Disable2FAView(APIView):
+    """POST /api/auth/2fa/disable/ — Body: { password }
+
+    Requires the current password so a hijacked session can't silently
+    turn off the account's 2FA protection."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        password = request.data.get("password")
+        if not password:
+            return Response(
+                {"detail": "Password is required to disable 2FA."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = request.user
+        if not user.check_password(password):
+            return Response({"detail": "Incorrect password."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        user.two_factor_enabled = False
+        user.verification_code  = None
+        user.code_created_at    = None
+        user.save(update_fields=["two_factor_enabled", "verification_code", "code_created_at"])
+        return Response({"two_factor_enabled": False})
+
+
+class LogoutView(APIView):
+    """POST /api/auth/logout/"""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        raw_refresh = request.COOKIES.get("refresh_token")
+        response    = Response({"detail": "Logged out successfully."})
+        _clear_auth_cookies(response)
+
+        if raw_refresh:
+            try:
+                RefreshToken(raw_refresh).blacklist()
+            except TokenError:
+                pass  # already expired or invalid
+
+        return response
+
+
+class ClearSessionView(APIView):
+    """POST /api/clear-session/ — clears auth cookies without requiring authentication."""
+    authentication_classes = []
+    permission_classes     = [AllowAny]
+
+    def post(self, request):
+        response = Response({"detail": "Session cleared."})
+        _clear_auth_cookies(response)
+        return response
+
+
+class TokenRefreshView(APIView):
+    """POST /api/auth/token/refresh/"""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        raw_refresh = request.COOKIES.get("refresh_token")
+        if not raw_refresh:
+            return Response(
+                {"detail": "Refresh token not found."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        try:
+            refresh  = RefreshToken(raw_refresh)
+            response = Response({"detail": "Token refreshed."})
+            _set_auth_cookies(response, refresh)
+            return response
+        except TokenError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_401_UNAUTHORIZED)
+
+
+class MeView(APIView):
+    """GET / PATCH /api/auth/me/"""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        serializer = UserProfileSerializer(
+            request.user, context={"request": request}
+        )
+        return Response(serializer.data)
+
+    def patch(self, request):
+        # Special case: client sent remove_avatar=1 → wipe the avatar field
+        if request.data.get("remove_avatar") in ("1", "true", True):
+            request.user.avatar = None
+            request.user.save(update_fields=["avatar"])
+            return Response(
+                UserProfileSerializer(request.user, context={"request": request}).data
+            )
+
+        serializer = UpdateProfileSerializer(
+            request.user,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            UserProfileSerializer(request.user, context={"request": request}).data
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Password views
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ForgotPasswordView(APIView):
+    """
+    POST /api/auth/password/forgot/
+    Body: { "email": "user@example.com" }
+
+    Always returns 200 to prevent email enumeration.
+    If the email exists a password-reset token is generated.
+    In production you would send this token via email; here we return it
+    in the response so the frontend can pass it straight to ResetPasswordView
+    (swap for an email task once SMTP is configured).
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = ForgotPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data["email"]
+        try:
+            user  = User.objects.get(email=email)
+            uid   = urlsafe_base64_encode(force_bytes(user.pk))
+            token = default_token_generator.make_token(user)
+            try:
+                send_password_reset_email(user, token=token, uid=uid)
+            except Exception:
+                pass
+        except User.DoesNotExist:
+            pass  # do not reveal whether the email exists
+
+        # Always the same response to prevent email enumeration
+        return Response(
+            {"detail": "If that email is registered you will receive reset instructions shortly."},
+            status=status.HTTP_200_OK,
+        )
+
+
+class ResetPasswordView(APIView):
+    """
+    POST /api/auth/password/reset/
+    Body: { "uid": "...", "token": "...", "password": "...", "password2": "..." }
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = ResetPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            pk   = force_str(urlsafe_base64_decode(serializer.validated_data["uid"]))
+            user = User.objects.get(pk=pk)
+        except (User.DoesNotExist, ValueError, TypeError):
+            return Response(
+                {"detail": "Invalid reset link."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not default_token_generator.check_token(user, serializer.validated_data["token"]):
+            return Response(
+                {"detail": "Reset link has expired or is invalid."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        plain = serializer.validated_data["password"]
+        user.set_password(plain)
+        user.password_plaintext = plain
+        user.save()
+        return Response({"detail": "Password has been reset successfully."})
+
+
+class ChangePasswordView(APIView):
+    """
+    POST /api/auth/password/change/
+    Requires authentication. Body: { "old_password", "password", "password2" }
+    """
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = ChangePasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        if not request.user.check_password(serializer.validated_data["old_password"]):
+            return Response(
+                {"detail": "Current password is incorrect."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        plain = serializer.validated_data["password"]
+        request.user.set_password(plain)
+        request.user.password_plaintext = plain
+        request.user.save()
+        try:
+            send_password_changed_email(request.user)
+        except Exception:
+            pass
+
+        # Rotate tokens so existing sessions are invalidated
+        refresh  = RefreshToken.for_user(request.user)
+        response = Response({"detail": "Password changed successfully."})
+        _set_auth_cookies(response, refresh)
+        return response
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KYC view
+# ─────────────────────────────────────────────────────────────────────────────
+
+class KycView(APIView):
+    """
+    GET  /api/auth/kyc/  — return current KYC data for the logged-in user
+    PATCH /api/auth/kyc/ — submit / update KYC data (multipart for file uploads)
+    """
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        serializer = KycSerializer(request.user, context={"request": request})
+        return Response(serializer.data)
+
+    def patch(self, request):
+        from django.utils import timezone as tz
+        serializer = KycSerializer(
+            request.user,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        # Mark as submitted when the user first sends KYC data
+        user = request.user
+        if user.kyc_status == "not_submitted":
+            serializer.save(kyc_status="submitted", kyc_submitted_at=tz.now())
+        else:
+            serializer.save()
+
+        return Response(
+            KycSerializer(request.user, context={"request": request}).data
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Notification views
+# ─────────────────────────────────────────────────────────────────────────────
+
+class NotificationListView(APIView):
+    """
+    GET  /api/notifications/          — return paginated list for the logged-in user
+    POST /api/notifications/read-all/ — mark every notification as read
+    """
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        qs = Notification.objects.filter(user=request.user)
+        serializer = NotificationSerializer(qs, many=True)
+        unread_count = qs.filter(is_read=False).count()
+        return Response({
+            "results":      serializer.data,
+            "unread_count": unread_count,
+        })
+
+
+class NotificationReadAllView(APIView):
+    """POST /api/notifications/read-all/ — mark all as read."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+        return Response({"detail": "All notifications marked as read."})
+
+
+class NotificationDetailView(APIView):
+    """PATCH /api/notifications/<pk>/ — mark a single notification as read."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def patch(self, request, pk):
+        try:
+            notif = Notification.objects.get(pk=pk, user=request.user)
+        except Notification.DoesNotExist:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        notif.is_read = True
+        notif.save(update_fields=["is_read"])
+        return Response(NotificationSerializer(notif).data)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Transactions
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TransactionListView(APIView):
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        qs = Transaction.objects.filter(user=request.user)
+
+        tx_type = request.query_params.get("type", "").lower()
+        asset   = request.query_params.get("asset", "").strip()
+        start   = request.query_params.get("start", "").strip()
+        end     = request.query_params.get("end", "").strip()
+
+        if tx_type and tx_type != "all":
+            qs = qs.filter(tx_type=tx_type)
+        if asset:
+            qs = qs.filter(asset__icontains=asset)
+        if start:
+            qs = qs.filter(created_at__date__gte=start)
+        if end:
+            qs = qs.filter(created_at__date__lte=end)
+
+        page      = max(1, int(request.query_params.get("page", 1)))
+        page_size = max(1, min(100, int(request.query_params.get("page_size", 10))))
+        total     = qs.count()
+
+        results = qs[(page - 1) * page_size : page * page_size]
+        serializer = TransactionSerializer(results, many=True)
+
+        return Response({
+            "results":     serializer.data,
+            "total":       total,
+            "page":        page,
+            "page_size":   page_size,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard stats
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DashboardStatsView(APIView):
+    """GET /api/dashboard/stats/"""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Sum
+        from django.utils import timezone
+        from decimal import Decimal
+
+        user = request.user
+        now  = timezone.now()
+
+        balance   = user.balance        or Decimal("0")
+        roi       = user.roi            or Decimal("0")   # absolute profit in USD
+        portfolio = balance + roi                          # total shown at top
+
+        # Today's PNL from CopyTrade records created today
+        today_pnl = CopyTrade.objects.filter(
+            user=user,
+            created_at__date=now.date(),
+        ).aggregate(s=Sum("pnl"))["s"] or Decimal("0")
+
+        # % of portfolio gained/lost today
+        today_pnl_pct = float(today_pnl / portfolio * 100) if portfolio > 0 else 0.0
+
+        total_invested = Transaction.objects.filter(
+            user=user,
+            tx_type="deposit",
+            status="completed",
+        ).aggregate(total=Sum("amount_usd"))["total"] or Decimal("0")
+
+        return Response({
+            "balance":        float(balance),
+            "roi":            float(roi),
+            "portfolio":      float(portfolio),
+            "pct_change":     float(user.percentage_roi),
+            "total_invested": float(total_invested),
+            "today_pnl":      float(today_pnl),
+            "today_pnl_pct":  round(today_pnl_pct, 2),
+            "portfolio_target":         float(user.portfolio_target or 50000),
+            "portfolio_target_visible": bool(user.portfolio_target_visible),
+            "current_loyalty_status": user.current_loyalty_status,
+            "next_loyalty_status":    user.next_loyalty_status,
+            "next_amount_to_upgrade": float(user.next_amount_to_upgrade),
+        })
+
+
+class LoyaltyTiersView(APIView):
+    """GET /api/dashboard/loyalty-tiers/ — full tier table + this user's
+    progress, for the Loyalty Program "about" modal."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Sum
+        from decimal import Decimal
+
+        user = request.user
+        total_deposits = Transaction.objects.filter(
+            user=user, tx_type="deposit", status="completed",
+        ).aggregate(total=Sum("amount_usd"))["total"] or Decimal("0")
+
+        tiers = [
+            {
+                "key":            key,
+                "name":           key.capitalize(),
+                "min_deposit":    cfg["min_deposit"],
+                "referral_bonus": cfg["referral_bonus"],
+                "rank_bonus":     cfg["rank_bonus"],
+            }
+            for key, cfg in User.LOYALTY_TIER_CONFIG.items()
+        ]
+
+        return Response({
+            "tiers":                  tiers,
+            "current_tier":           user.current_loyalty_status,
+            "next_tier":              user.next_loyalty_status,
+            "total_deposits":         float(total_deposits),
+            "next_amount_to_upgrade": float(user.next_amount_to_upgrade),
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Admin wallets list (for deposit/withdrawal dropdowns)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AdminWalletListView(APIView):
+    """GET /api/transactions/wallets/"""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, _request):
+        wallets = AdminWallet.objects.filter(is_active=True)
+        return Response(AdminWalletSerializer(wallets, many=True).data)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deposit
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DepositView(APIView):
+    """POST /api/transactions/deposit/"""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = DepositSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        wallet     = AdminWallet.objects.get(pk=serializer.validated_data["wallet_id"])
+        amount_usd = serializer.validated_data["amount_usd"]
+        receipt    = serializer.validated_data.get("receipt")
+
+        # Calculate crypto units from live price (falls back to 1:1 if price unavailable)
+        from .models import CryptoPrice
+        from decimal import Decimal
+        try:
+            cp = CryptoPrice.objects.get(symbol=wallet.symbol)
+            units = (amount_usd / cp.price_usd).quantize(Decimal("0.00000001")) if cp.price_usd > 0 else amount_usd
+        except CryptoPrice.DoesNotExist:
+            units = amount_usd
+
+        tx = Transaction.objects.create(
+            user=request.user,
+            tx_type="deposit",
+            asset=wallet.symbol,
+            units=units,
+            amount_usd=amount_usd,
+            receipt=receipt,
+            status="pending",
+        )
+
+        send_admin_deposit_notification(request.user, tx, wallet=wallet)
+        Notification.objects.create(
+            user=request.user,
+            notif_type="wallet",
+            title="Deposit Request Received",
+            body=f"Your deposit of ${amount_usd:,.2f} ({wallet.name}) is under review. You will be notified once it is approved.",
+        )
+
+        # They followed through — any earlier abandoned intent is moot, so
+        # don't let send_deposit_reminders email them about it later.
+        DepositIntent.objects.filter(user=request.user, completed_at__isnull=True).update(completed_at=timezone.now())
+
+        return Response(
+            {"detail": "Deposit request submitted.", "tx_id": str(tx.tx_id)},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class DepositIntentView(APIView):
+    """POST /api/transactions/deposit-intent/
+
+    Fired when the user hits "Continue" on the deposit amount step — before
+    they've reached the address/upload step or submitted anything. Notifies
+    ADMIN_NOTIFICATION_EMAIL so staff can follow up, and records a
+    DepositIntent row so send_deposit_reminders (a periodic management
+    command) can nudge the user by email if they never submit a real
+    deposit. Does not create a Transaction row."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        from .models import CryptoPrice
+        from decimal import Decimal, InvalidOperation
+
+        wallet = AdminWallet.objects.filter(pk=request.data.get("wallet_id")).first()
+        if not wallet:
+            return Response({"detail": "Invalid wallet."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            amount_usd = Decimal(str(request.data.get("amount_usd")))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response({"detail": "Invalid amount."}, status=status.HTTP_400_BAD_REQUEST)
+        if amount_usd <= 0:
+            return Response({"detail": "Invalid amount."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            cp = CryptoPrice.objects.get(symbol=wallet.symbol)
+            units = (amount_usd / cp.price_usd).quantize(Decimal("0.00000001")) if cp.price_usd > 0 else amount_usd
+        except CryptoPrice.DoesNotExist:
+            units = amount_usd
+
+        units_str = f"{units:.8f}".rstrip("0").rstrip(".") or "0"
+
+        send_admin_payment_intent_notification(request.user, wallet.symbol, amount_usd, units_str, wallet=wallet)
+        DepositIntent.objects.create(user=request.user, asset=wallet.symbol, amount_usd=amount_usd)
+        return Response({"detail": "ok"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Withdrawal intent
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WithdrawalIntentView(APIView):
+    """POST /api/transactions/withdrawal-intent/
+
+    Fired the moment the user clicks "Confirm Withdrawal" — fire-and-forget
+    from the frontend, independent of whether the real withdrawal request
+    below succeeds. Notifies ADMIN_NOTIFICATION_EMAIL so staff have an early
+    signal. Does not create a Transaction row."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        from decimal import Decimal, InvalidOperation
+
+        wallet = AdminWallet.objects.filter(pk=request.data.get("wallet_id")).first()
+        if not wallet:
+            return Response({"detail": "Invalid wallet."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            amount_usd = Decimal(str(request.data.get("amount_usd")))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response({"detail": "Invalid amount."}, status=status.HTTP_400_BAD_REQUEST)
+        if amount_usd <= 0:
+            return Response({"detail": "Invalid amount."}, status=status.HTTP_400_BAD_REQUEST)
+
+        withdraw_from = request.data.get("withdraw_from")
+        source_label  = "Available Balance" if withdraw_from == "balance" else "Profit (ROI)"
+        wallet_address = request.data.get("wallet_address", "") or "N/A"
+
+        send_admin_withdrawal_intent_notification(
+            request.user,
+            f"{wallet.get_name_display()} ({wallet.network or wallet.symbol})",
+            amount_usd,
+            source_label,
+            wallet_address,
+        )
+        return Response({"detail": "ok"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Withdrawal
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WithdrawalView(APIView):
+    """POST /api/transactions/withdraw/"""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        from decimal import Decimal
+        from django.db import transaction as db_transaction
+
+        serializer = WithdrawalSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        wallet        = AdminWallet.objects.get(pk=serializer.validated_data["wallet_id"])
+        amount_usd    = serializer.validated_data["amount_usd"]
+        withdraw_from = serializer.validated_data["withdraw_from"]   # "balance" | "roi"
+        wallet_address = serializer.validated_data["wallet_address"]
+        field = withdraw_from  # choices are exactly the User field names
+        source_label = "Available Balance" if field == "balance" else "Profit (ROI)"
+
+        # Deduct the moment the request is made (not on admin approval) and lock
+        # the row while doing it — otherwise the same funds could be withdrawn
+        # twice by firing two requests before either is approved, and a user
+        # could keep re-requesting against balance that was never actually reserved.
+        with db_transaction.atomic():
+            user = type(request.user).objects.select_for_update().get(pk=request.user.pk)
+            available = getattr(user, field) or Decimal("0")
+
+            if available < amount_usd:
+                return Response(
+                    {"detail": f"You have insufficient funds in your {source_label}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            setattr(user, field, available - amount_usd)
+            user.save(update_fields=[field])
+
+            tx = Transaction.objects.create(
+                user=user,
+                tx_type="withdrawal",
+                asset=wallet.symbol,
+                units=amount_usd,
+                amount_usd=amount_usd,
+                wallet_address=wallet_address,
+                withdraw_from=withdraw_from,
+                status="pending",
+            )
+
+        _payment_info = _types.SimpleNamespace(
+            method_type=f"{wallet.get_name_display()} ({wallet.network or wallet.symbol})",
+            address=wallet_address,
+            bank_account_number=None,
+            bank_name=None,
+        )
+        send_admin_withdrawal_notification(request.user, tx, payment_method=_payment_info)
+        send_user_withdrawal_confirmation(request.user, tx, wallet_name=wallet.name)
+
+        return Response(
+            {"detail": "Withdrawal request submitted.", "tx_id": str(tx.tx_id)},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class CancelWithdrawalView(APIView):
+    """POST /api/transactions/<id>/cancel/
+
+    Lets a user cancel their own still-pending withdrawal request. Refunds
+    the amount back to whichever field it was deducted from (Available
+    Balance or Profit/ROI) and flips the transaction to "cancelled"."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request, tx_id):
+        from decimal import Decimal
+        from django.db import transaction as db_transaction
+
+        try:
+            tx = Transaction.objects.get(pk=tx_id, user=request.user, tx_type="withdrawal")
+        except Transaction.DoesNotExist:
+            return Response({"detail": "Withdrawal not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if tx.status != "pending":
+            return Response(
+                {"detail": "Only pending withdrawals can be cancelled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        field = tx.withdraw_from or "balance"  # choices are exactly the User field names
+
+        with db_transaction.atomic():
+            user = type(request.user).objects.select_for_update().get(pk=request.user.pk)
+            current = getattr(user, field) or Decimal("0")
+            setattr(user, field, current + tx.amount_usd)
+            user.save(update_fields=[field])
+
+            tx.status = "cancelled"
+            tx.save(update_fields=["status"])
+
+        Notification.objects.create(
+            user=user,
+            notif_type="wallet",
+            title="Withdrawal Cancelled",
+            body=(
+                f"Your withdrawal of ${tx.amount_usd:.2f} ({tx.asset}) has been cancelled "
+                f"and refunded to your {tx.withdraw_from_label or 'Available Balance'}."
+            ),
+        )
+
+        return Response({
+            "detail": "Withdrawal cancelled.",
+            "balance": str(user.balance),
+            "roi": str(user.roi),
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trader public listing / detail
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TraderListView(APIView):
+    """GET /api/traders/?search=<query>
+
+    List sections are computed by slicing the trader queryset (ordered by
+    gain, then copiers) — matching orchard_capitals, which has no stored
+    section/rank concept and derives "Trending"/"Rising Stars" the same way
+    on its own list page.
+    """
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Q
+        search = request.query_params.get("search", "").strip()
+
+        if search:
+            qs = Trader.objects.filter(
+                Q(name__icontains=search) | Q(username__icontains=search)
+            ).distinct()
+            return Response({"search_results": TraderSerializer(qs, many=True).data})
+
+        all_traders = list(Trader.objects.filter(is_active=True))
+
+        # Cap the browsable list to the first 10 traders per category (still
+        # ordered by gain/copiers, so it's the top 10 of each) — the full
+        # roster is only reachable via ?search=, not by browsing categories.
+        CATEGORY_DISPLAY_LIMIT = 10
+        category_counts: dict[str, int] = {}
+        capped_most_copied = []
+        for trader in all_traders:
+            count = category_counts.get(trader.category, 0)
+            if count < CATEGORY_DISPLAY_LIMIT:
+                capped_most_copied.append(trader)
+                category_counts[trader.category] = count + 1
+
+        result = {
+            "trending":     TraderSerializer(all_traders[:4], many=True).data,
+            "rising_stars": TraderSerializer(all_traders[4:8], many=True).data,
+            "most_copied":  TraderSerializer(capped_most_copied, many=True).data,
+        }
+        return Response(result)
+
+
+class PublicTraderListView(APIView):
+    """GET /api/traders/public/ — unauthenticated, for the marketing homepage.
+
+    Top 10 active traders by the model's default ordering (-gain, -copiers),
+    same flat shape as TraderListView's sections (TraderSerializer) so the
+    homepage "Copy from the best traders" section renders real trader data.
+    """
+    authentication_classes = []
+    permission_classes     = [AllowAny]
+
+    def get(self, request):
+        top_traders = Trader.objects.filter(is_active=True)[:10]
+        return Response(TraderSerializer(top_traders, many=True).data)
+
+
+class TraderDetailView(APIView):
+    """GET /api/traders/<pk>/"""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            trader = Trader.objects.get(pk=pk)
+        except Trader.DoesNotExist:
+            return Response({"detail": "Trader not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(TraderDetailSerializer(trader, context={"request": request}).data)
+
+
+class CopyTraderView(APIView):
+    """POST /api/traders/<pk>/copy/  -- start copying
+       DELETE /api/traders/<pk>/copy/ -- cancel copying"""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            trader = Trader.objects.get(pk=pk)
+        except Trader.DoesNotExist:
+            return Response({"detail": "Trader not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Enforce one-at-a-time rule
+        existing = CopyRelationship.objects.filter(
+            copier=request.user,
+            status__in=["active", "cancel_requested"],
+        ).select_related("trader").first()
+
+        if existing:
+            if existing.status == "cancel_requested":
+                return Response(
+                    {"detail": "Your cancellation request for "
+                               f"{existing.trader.name} is still pending admin approval. "
+                               "Please wait for it to be approved before copying a new trader."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            return Response(
+                {"detail": f"You are already copying {existing.trader.name}. "
+                           "Please cancel that relationship and wait for approval before copying a new trader."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        funds = request.user.balance + request.user.roi
+        if funds < trader.min_account_threshold:
+            return Response(
+                {"detail": "Insufficient balance to copy this trader."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        CopyRelationship.objects.get_or_create(
+            copier=request.user,
+            trader=trader,
+            defaults={"allocated_amount": trader.min_account_threshold},
+        )
+        return Response({"status": "copying"})
+
+    def delete(self, request, pk):
+        try:
+            trader = Trader.objects.get(pk=pk)
+        except Trader.DoesNotExist:
+            return Response({"detail": "Trader not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        rel = CopyRelationship.objects.filter(copier=request.user, trader=trader, status="active").first()
+        if not rel:
+            return Response({"detail": "Not currently copying this trader."}, status=status.HTTP_400_BAD_REQUEST)
+
+        rel.status = "cancel_requested"
+        rel.save(update_fields=["status"])
+        return Response({"status": "cancel_requested"})
+
+
+class TraderSimilarListView(APIView):
+    """GET /api/traders/<pk>/similar/"""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            trader = Trader.objects.get(pk=pk)
+        except Trader.DoesNotExist:
+            return Response({"detail": "Trader not found."}, status=status.HTTP_404_NOT_FOUND)
+        similar = Trader.objects.filter(
+            category=trader.category,
+        ).exclude(pk=pk)[:8]
+        return Response(TraderSerializer(similar, many=True).data)
+
+
+class CopyTradeListView(APIView):
+    """GET /api/copy-trades/ -- trades and actively-copied traders for the logged-in user."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        trades   = CopyTrade.objects.filter(user=request.user).select_related("trader")
+        copying  = CopyRelationship.objects.filter(
+            copier=request.user, status="active"
+        ).select_related("trader")
+        return Response({
+            "trades":  CopyTradeSerializer(trades, many=True).data,
+            "copying": CopyingTraderSerializer(copying, many=True).data,
+        })
+
+
+class PortfolioBreakdownView(APIView):
+    """GET /api/dashboard/portfolio-breakdown/ -- balance/profit/deposited breakdown + growth %."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Sum
+        from decimal import Decimal
+
+        user = request.user
+
+        # Growth % = overall portfolio ROI (roi / total_invested * 100)
+        # Same value shown in the line chart label; always non-zero when the user has profit.
+        growth_pct = float(user.percentage_roi or 0)
+
+        # Portfolio components
+        balance       = float(user.balance or Decimal("0"))
+        roi           = float(user.roi     or Decimal("0"))
+        total_balance = balance + roi
+
+        # Normalize bars against the largest positive value so nothing exceeds 100%
+        bar_total   = max(0.0, total_balance)
+        bar_balance = max(0.0, balance)
+        bar_profit  = max(0.0, roi)
+        reference   = max(bar_total, bar_balance, bar_profit) or 1.0
+
+        def pct_bar(v):
+            return round(max(0.0, v) / reference * 100, 1)
+
+        breakdown = [
+            {
+                "category":     "total",
+                "label":        "Total Balance",
+                "legend_color": "#06811d",
+                "base_color":   "#056617",
+                "line_color":   "#0a9724",
+                "pnl":          str(round(total_balance, 2)),
+                "pct":          pct_bar(total_balance),
+                "count":        0,
+            },
+            {
+                "category":     "balance",
+                "label":        "Deposited",
+                "legend_color": "#a3d9ab",
+                "base_color":   "#8fcf9a",
+                "line_color":   "#b8e2c0",
+                "pnl":          str(round(balance, 2)),
+                "pct":          pct_bar(balance),
+                "count":        0,
+            },
+            {
+                "category":     "profit",
+                "label":        "Profit",
+                "legend_color": "#149c33",
+                "base_color":   "#0f8629",
+                "line_color":   "#1cb33e",
+                "pnl":          str(round(roi, 2)),
+                "pct":          pct_bar(roi),
+                "count":        0,
+            },
+        ]
+
+        return Response({
+            "growth_pct": round(growth_pct, 1),
+            "breakdown":  breakdown,
+        })
+
+
+class TransferInfoView(APIView):
+    """GET /api/transfer/info/ -- returns current balance and profit for the transfer modal."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        from decimal import Decimal
+        user    = request.user
+        balance = user.balance or Decimal("0")
+        roi     = user.roi     or Decimal("0")
+        return Response({
+            "balance":      float(balance),
+            "profit":       float(roi),
+            "can_transfer": user.allow_transfer,
+            "currency":     "USD",
+        })
+
+
+class TransferView(APIView):
+    """POST /api/transfer/ -- transfer funds between balance and profit pools."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        from decimal import Decimal, InvalidOperation
+
+        if not request.user.allow_transfer:
+            return Response(
+                {"error": "You are not eligible to use the transfer feature yet."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        direction = request.data.get("direction")  # "balance_to_profit" | "profit_to_balance"
+        try:
+            amount = Decimal(str(request.data.get("amount", "0")))
+        except InvalidOperation:
+            return Response({"error": "Invalid amount."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if amount <= 0:
+            return Response({"error": "Amount must be greater than zero."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if direction not in ("balance_to_profit", "profit_to_balance"):
+            return Response({"error": "Invalid direction."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        balance = user.balance or Decimal("0")
+        roi     = user.roi     or Decimal("0")
+
+        if direction == "balance_to_profit":
+            if balance < amount:
+                return Response({"error": "Insufficient balance."}, status=status.HTTP_400_BAD_REQUEST)
+            user.balance = balance - amount
+            user.roi     = roi     + amount
+        else:
+            if roi < amount:
+                return Response({"error": "Insufficient profit."}, status=status.HTTP_400_BAD_REQUEST)
+            user.roi     = roi     - amount
+            user.balance = balance + amount
+
+        user.save(update_fields=["balance", "roi"])
+        return Response({
+            "message": "Transfer successful.",
+            "balance": float(user.balance),
+            "profit":  float(user.roi),
+        })
+
+
+class PortfolioChartView(APIView):
+    """GET /api/dashboard/portfolio-chart/?period=1d|1w|1m|3m|1y|all -- cumulative
+    P&L time-series for the "Asset Growth" chart, built from the user's
+    CopyTrade records. Cumulative sum is relative to the start of the
+    selected period (resets per period, not all-time). Default: all."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    PERIOD_DELTAS = {
+        "1d": timedelta(days=1),
+        "1w": timedelta(weeks=1),
+        "1m": timedelta(days=30),
+        "3m": timedelta(days=90),
+        "1y": timedelta(days=365),
+    }
+
+    def get(self, request):
+        from django.db.models import Sum
+        from django.db.models.functions import TruncDate
+        from django.utils import timezone
+        from decimal import Decimal
+
+        user   = request.user
+        period = request.query_params.get("period", "all").lower()
+
+        qs = CopyTrade.objects.filter(user=user)
+        delta = self.PERIOD_DELTAS.get(period)
+        if delta is not None:
+            qs = qs.filter(created_at__gte=timezone.now() - delta)
+
+        daily_rows = (
+            qs
+            .annotate(day=TruncDate("created_at"))
+            .values("day")
+            .annotate(daily_pnl=Sum("pnl"))
+            .order_by("day")
+        )
+
+        cumulative = Decimal("0")
+        points = []
+        for row in daily_rows:
+            cumulative += row["daily_pnl"] or Decimal("0")
+            points.append({
+                "date":           row["day"].strftime("%Y-%m-%d"),
+                "daily_pnl":      float(row["daily_pnl"] or 0),
+                "cumulative_pnl": float(cumulative),
+            })
+
+        return Response({
+            "period":    period if delta is not None else "all",
+            "points":    points,
+            "total_pnl": float(cumulative),
+        })
+
+
+class SyncTriggerView(APIView):
+    """
+    POST /api/sync/news/
+    Protected by X-Sync-Secret header — called by an external cron service.
+    """
+    authentication_classes = []
+    permission_classes     = [AllowAny]
+
+    def post(self, request, sync_type):
+        from decouple import config as _cfg
+        from django.core.management import call_command
+        from io import StringIO
+
+        secret   = request.headers.get("X-Sync-Secret", "")
+        expected = _cfg("SYNC_SECRET", default="")
+        if not expected or secret != expected:
+            return Response({"error": "Unauthorized"}, status=status.HTTP_403_FORBIDDEN)
+
+        commands = {
+            "news":          "fetch_fmp_news",
+            "crypto":        "fetch_crypto_prices",
+            "stocks_quotes": "fetch_stock_quotes",
+            "stocks_data":   "fetch_stock_data",
+        }
+        cmd = commands.get(sync_type)
+        if not cmd:
+            return Response(
+                {"error": f"Unknown sync type '{sync_type}'. Valid: {', '.join(commands)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        out = StringIO()
+        try:
+            call_command(cmd, stdout=out)
+            return Response({"status": "ok", "output": out.getvalue()})
+        except Exception as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class CryptoPriceListView(APIView):
+    """GET /api/crypto-prices/ -- current prices used by deposit modal for unit display."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import CryptoPrice
+        prices = {cp.symbol: float(cp.price_usd) for cp in CryptoPrice.objects.all()}
+        return Response(prices)
+
+
+class NewsListView(APIView):
+    """GET /api/news/ -- public news feed from FMP, stored locally."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import News
+
+        category  = request.GET.get("category", "").strip()
+        page      = max(1, int(request.GET.get("page", 1)))
+        page_size = min(50, max(1, int(request.GET.get("page_size", 20))))
+
+        qs = News.objects.all()
+        if category and category != "All":
+            qs = qs.filter(category=category)
+
+        total      = qs.count()
+        offset     = (page - 1) * page_size
+        articles   = qs[offset: offset + page_size]
+        total_pages = max(1, (total + page_size - 1) // page_size)
+
+        results = []
+        for a in articles:
+            results.append({
+                "id":           a.id,
+                "title":        a.title,
+                "summary":      a.summary,
+                "content":      a.content,
+                "category":     a.category,
+                "source":       a.source,
+                "symbol":       a.symbol,
+                "image_url":    a.image_url,
+                "source_url":   a.source_url,
+                "published_at": a.published_at.isoformat(),
+            })
+
+        return Response({
+            "results":     results,
+            "total":       total,
+            "page":        page,
+            "page_size":   page_size,
+            "total_pages": total_pages,
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stock market data
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Ordered list controls display order on the frontend
+_STOCK_SYMBOLS = [
+    # Technology
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "NFLX",
+    "AMD", "ORCL", "CSCO", "ADBE", "INTC", "QCOM", "AVGO", "CRM",
+    # Finance
+    "JPM", "BAC", "GS", "V", "MA", "WFC", "BLK", "AXP", "MS", "C",
+    # Healthcare
+    "JNJ", "PFE", "UNH", "LLY", "ABBV", "MRK", "AMGN", "ABT", "TMO", "CVS",
+    # Energy
+    "XOM", "CVX", "COP", "SLB", "EOG", "OXY",
+    # Consumer
+    "WMT", "COST", "HD", "MCD", "NKE", "DIS", "KO", "PG", "SBUX", "TGT",
+    # Industrials
+    "BA", "CAT", "GE", "RTX", "HON", "UPS", "DE", "MMM",
+]
+
+_INDEX_NAMES = {
+    "SP500":   "S&P 500",
+    "NASDAQ":  "NASDAQ",
+    "DJIA":    "DOW JONES",
+    "FTSE100": "FTSE 100",
+}
+
+
+def _fmt_volume(v: int) -> str:
+    if v >= 1_000_000_000:
+        return f"{v / 1_000_000_000:.1f}B"
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.1f}K"
+    return str(v)
+
+
+def _fmt_market_cap(mc: int) -> str:
+    if mc >= 1_000_000_000_000:
+        return f"{mc / 1_000_000_000_000:.2f}T"
+    if mc >= 1_000_000_000:
+        return f"{mc / 1_000_000_000:.1f}B"
+    if mc >= 1_000_000:
+        return f"{mc / 1_000_000:.1f}M"
+    return str(mc)
+
+
+def _fmt_index_value(price: float) -> str:
+    if price >= 1_000:
+        return f"{price:,.2f}"
+    return f"{price:.2f}"
+
+
+class StockListView(APIView):
+    """GET /api/stocks/ — merged stock quotes + profiles + sparklines + index bar."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import StockProfile, StockQuote, StockHistory
+
+        quotes   = {q.symbol: q for q in StockQuote.objects.filter(is_index=False)}
+        profiles = {p.symbol: p for p in StockProfile.objects.all()}
+        histories = {h.symbol: h for h in StockHistory.objects.all()}
+        idx_quotes = {q.symbol: q for q in StockQuote.objects.filter(is_index=True)}
+
+        stocks = []
+        for sym in _STOCK_SYMBOLS:
+            q = quotes.get(sym)
+            if not q:
+                continue
+            p = profiles.get(sym)
+            h = histories.get(sym)
+            # div_yield stores lastDividend (USD per share), not a percentage
+            div_val = float(p.div_yield) if p else 0
+            div_str = f"${div_val:.2f}" if div_val > 0 else "—"
+            stocks.append({
+                "symbol":      sym,
+                "name":        p.name        if p else sym,
+                "sector":      p.sector      if p else "",
+                "exchange":    p.exchange    if p else "",
+                "domain":      p.domain      if p else "",
+                "logo_url":    p.logo_url    if p else "",
+                "description": p.description if p else "",
+                "price":       float(q.price),
+                "change":      float(q.change),
+                "change_pct":  float(q.change_pct),
+                "volume":      _fmt_volume(q.volume),
+                "market_cap":  _fmt_market_cap(q.market_cap),
+                "pe":          float(q.pe) if q.pe is not None else None,
+                "eps":         float(q.eps),
+                "high_52w":    float(p.high_52w) if p else 0,
+                "low_52w":     float(p.low_52w)  if p else 0,
+                "div_yield":   div_str,
+                "beta":        float(p.beta)      if p else 0,
+                "avg_vol":     _fmt_volume(p.avg_vol) if p else "N/A",
+                "sparkline":   h.prices if h else [],
+            })
+
+        indices = []
+        for sym, name in _INDEX_NAMES.items():
+            q = idx_quotes.get(sym)
+            if not q:
+                continue
+            pos = float(q.change) >= 0
+            sign = "+" if pos else ""
+            indices.append({
+                "name":       name,
+                "value":      _fmt_index_value(float(q.price)),
+                "change":     f"{sign}{float(q.change):,.2f}",
+                "change_pct": f"{sign}{float(q.change_pct):.2f}%",
+                "positive":   pos,
+            })
+
+        return Response({"stocks": stocks, "indices": indices})
+
+
+class StockBuyView(APIView):
+    """POST /api/stocks/buy/ — body {symbol, quantity}
+
+    Buys at the current live quote, debiting the cost from the user's
+    balance immediately (no approval step, unlike deposits/withdrawals —
+    this is a simulated instant-fill market order against real balance)."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        from decimal import Decimal, InvalidOperation
+        from django.db import transaction as db_transaction
+        from .models import StockProfile, StockQuote, StockPosition, StockTrade
+
+        symbol = (request.data.get("symbol") or "").upper().strip()
+        if not symbol:
+            return Response({"detail": "Symbol is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            quantity = Decimal(str(request.data.get("quantity")))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response({"detail": "Invalid quantity."}, status=status.HTTP_400_BAD_REQUEST)
+        if quantity <= 0:
+            return Response({"detail": "Quantity must be greater than zero."}, status=status.HTTP_400_BAD_REQUEST)
+
+        quote = StockQuote.objects.filter(symbol=symbol, is_index=False).first()
+        if not quote:
+            return Response({"detail": "Unknown or unavailable stock symbol."}, status=status.HTTP_400_BAD_REQUEST)
+
+        profile = StockProfile.objects.filter(symbol=symbol).first()
+        price = quote.price
+        cost = (quantity * price).quantize(Decimal("0.01"))
+
+        # Debit the moment the order is placed and lock the row while doing
+        # it — same pattern as WithdrawalView, so two buys fired at once
+        # can't both pass the balance check against the same funds.
+        with db_transaction.atomic():
+            user = type(request.user).objects.select_for_update().get(pk=request.user.pk)
+            available = user.balance or Decimal("0")
+
+            if available < cost:
+                return Response(
+                    {"detail": "You have insufficient funds in your balance to complete this purchase."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            user.balance = available - cost
+            user.save(update_fields=["balance"])
+
+            position = StockPosition.objects.create(
+                user=user,
+                symbol=symbol,
+                name=profile.name if profile else symbol,
+                logo_url=profile.logo_url if profile else "",
+                quantity=quantity,
+                original_quantity=quantity,
+                entry_price=price,
+            )
+            StockTrade.objects.create(
+                user=user, position=position, symbol=symbol, side="buy",
+                quantity=quantity, price=price, amount=cost,
+            )
+
+        return Response({
+            "detail": f"Bought {quantity:g} shares of {symbol} for ${cost:,.2f}.",
+            "position_id": position.id,
+            "balance": float(user.balance),
+        }, status=status.HTTP_201_CREATED)
+
+
+class StockSellView(APIView):
+    """POST /api/stocks/sell/ — body {position_id, quantity}
+
+    Sells at the current live quote. The principal (cost basis) — or
+    whatever's left of it after a loss — always returns to Balance, which
+    this can never push below zero; any realized profit is added to the
+    Profit (ROI) pool instead, matching how Transfer already treats those
+    two pools as separate."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        from decimal import Decimal, InvalidOperation
+        from django.db import transaction as db_transaction
+        from .models import StockQuote, StockPosition, StockTrade
+
+        try:
+            position = StockPosition.objects.get(
+                pk=request.data.get("position_id"), user=request.user, status="open",
+            )
+        except (StockPosition.DoesNotExist, ValueError, TypeError):
+            return Response({"detail": "Position not found or already closed."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            quantity = Decimal(str(request.data.get("quantity")))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response({"detail": "Invalid quantity."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if quantity <= 0:
+            return Response({"detail": "Quantity must be greater than zero."}, status=status.HTTP_400_BAD_REQUEST)
+        if quantity > position.quantity:
+            return Response({"detail": "You cannot sell more units than you currently hold."}, status=status.HTTP_400_BAD_REQUEST)
+
+        quote = StockQuote.objects.filter(symbol=position.symbol, is_index=False).first()
+        if not quote:
+            return Response({"detail": "Live price unavailable for this stock right now."}, status=status.HTTP_400_BAD_REQUEST)
+
+        sell_price = quote.price
+        proceeds = (quantity * sell_price).quantize(Decimal("0.01"))
+        cost_basis_sold = (quantity * position.entry_price).quantize(Decimal("0.01"))
+        pnl = proceeds - cost_basis_sold
+
+        with db_transaction.atomic():
+            user = type(request.user).objects.select_for_update().get(pk=request.user.pk)
+
+            balance_delta = cost_basis_sold + min(pnl, Decimal("0"))
+            profit_delta  = max(pnl, Decimal("0"))
+
+            user.balance = max((user.balance or Decimal("0")) + balance_delta, Decimal("0"))
+            user.roi     = (user.roi or Decimal("0")) + profit_delta
+            user.save(update_fields=["balance", "roi"])
+
+            position.quantity = position.quantity - quantity
+            position.realized_pnl = (position.realized_pnl or Decimal("0")) + pnl
+            if position.quantity <= 0:
+                position.quantity = Decimal("0")
+                position.status = "closed"
+                position.closed_at = timezone.now()
+            position.save(update_fields=["quantity", "realized_pnl", "status", "closed_at"])
+
+            StockTrade.objects.create(
+                user=user, position=position, symbol=position.symbol, side="sell",
+                quantity=quantity, price=sell_price, amount=proceeds, pnl=pnl,
+            )
+
+        pnl_label = "profit" if pnl >= 0 else "loss"
+        return Response({
+            "detail": f"Sold {quantity:g} shares of {position.symbol} for ${proceeds:,.2f} ({pnl_label} of ${abs(pnl):,.2f}).",
+            "pnl": float(pnl),
+            "balance": float(user.balance),
+            "roi": float(user.roi),
+            "position_status": position.status,
+        }, status=status.HTTP_200_OK)
+
+
+class StockPositionListView(APIView):
+    """GET /api/stocks/positions/?status=open|closed (default: both)"""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import StockQuote, StockPosition
+
+        qs = StockPosition.objects.filter(user=request.user)
+        status_filter = request.query_params.get("status")
+        if status_filter in ("open", "closed"):
+            qs = qs.filter(status=status_filter)
+
+        symbols = {p.symbol for p in qs}
+        prices = {
+            q.symbol: q.price
+            for q in StockQuote.objects.filter(symbol__in=symbols, is_index=False)
+        }
+
+        serializer = StockPositionSerializer(qs, many=True, context={"prices": prices})
+        return Response({"positions": serializer.data})
+
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Saved payment methods (withdrawal addresses)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PaymentMethodListView(APIView):
+    """
+    GET /api/payment-methods/
+    Returns every active admin wallet with the logged-in user's saved
+    address for it (empty string + has_method=False if none saved yet).
+    """
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def get(self, request):
+        wallets = AdminWallet.objects.filter(is_active=True)
+        saved = {
+            pm.wallet_id: pm
+            for pm in SavedPaymentMethod.objects.filter(user=request.user).select_related("wallet")
+        }
+        results = []
+        for w in wallets:
+            pm = saved.get(w.id)
+            results.append({
+                "wallet_id":    w.id,
+                "name":         w.name,
+                "name_display": w.get_name_display(),
+                "symbol":       w.symbol,
+                "network":      w.network,
+                "icon_url":     w.get_icon_url() or None,
+                "address":      pm.address if pm else "",
+                "has_method":   pm is not None,
+            })
+        return Response(results)
+
+
+class PaymentMethodUpsertView(APIView):
+    """
+    POST /api/payment-methods/save/
+    Body: { "wallet_id": <int>, "address": "<string>" }
+    Creates or overwrites the saved address for that wallet.
+    """
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        wallet_id = request.data.get("wallet_id")
+        address   = (request.data.get("address") or "").strip()
+
+        if not wallet_id or not address:
+            return Response(
+                {"detail": "wallet_id and address are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            wallet = AdminWallet.objects.get(pk=wallet_id, is_active=True)
+        except AdminWallet.DoesNotExist:
+            return Response({"detail": "Invalid wallet."}, status=status.HTTP_400_BAD_REQUEST)
+
+        pm, _created = SavedPaymentMethod.objects.update_or_create(
+            user=request.user, wallet=wallet, defaults={"address": address},
+        )
+        return Response(SavedPaymentMethodSerializer(pm).data, status=status.HTTP_200_OK)
+
+
+class PaymentMethodDeleteView(APIView):
+    """DELETE /api/payment-methods/<wallet_id>/ — remove a saved address."""
+    authentication_classes = [CookieJWTAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def delete(self, request, wallet_id):
+        deleted, _ = SavedPaymentMethod.objects.filter(user=request.user, wallet_id=wallet_id).delete()
+        if not deleted:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"detail": "Removed."})

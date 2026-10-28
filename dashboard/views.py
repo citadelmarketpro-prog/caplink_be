@@ -1,0 +1,1109 @@
+import json
+from decimal import Decimal
+
+from django.contrib import messages
+from django.contrib.auth import authenticate, get_user_model, login, logout
+from django.core.paginator import Paginator
+from django.db.models import Q, Sum, Count
+from django.http import JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
+from django.views.decorators.csrf import ensure_csrf_cookie
+from django.views.decorators.http import require_POST
+
+from core.models import (
+    AdminWallet, Card, CopyRelationship, CopyTrade, Notification,
+    SavedPaymentMethod, Signal, Trader, Transaction, WalletConnection,
+)
+from core.email_service import (
+    send_custom_email_batch, send_kyc_approved_email, send_user_deposit_approved_email,
+    render_custom_email_preview,
+)
+from core.fmp_client import search_symbols
+from .decorators import superuser_required
+from .models import EmailCampaign, EmailCampaignRecipient
+from .trader_seed import seed_trader_demo_data
+from .forms import (
+    AddTradeForm, AdminWalletForm, AdjustFundsForm, CardEditForm, CustomEmailForm,
+    EditCopyTradeForm, NotificationForm, RejectKycForm, RejectTransactionForm, SetUserPasswordForm,
+    SignalForm, TraderForm, TransactionEditForm, WalletConnectionForm,
+    UserCreateForm, UserEditForm,
+    ASSET_MAP, ASSET_ICON_MAP,
+)
+
+User = get_user_model()
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+@ensure_csrf_cookie
+def panel_login(request):
+    if request.user.is_authenticated and request.user.is_superuser:
+        return redirect("panel:dashboard")
+    error = None
+    if request.method == "POST":
+        user = authenticate(request, username=request.POST.get("email","").strip(), password=request.POST.get("password",""))
+        if user and user.is_superuser:
+            login(request, user)
+            return redirect(request.GET.get("next", "panel:dashboard"))
+        error = "Invalid credentials or insufficient privileges."
+    return render(request, "panel/auth/login.html", {"error": error})
+
+
+def panel_logout(request):
+    logout(request)
+    return redirect("panel:login")
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+
+@superuser_required
+def dashboard_home(request):
+    return render(request, "panel/dashboard.html", {
+        "total_users":           User.objects.count(),
+        "kyc_pending":           User.objects.filter(kyc_status__in=["submitted","under_review"]).count(),
+        "kyc_approved":          User.objects.filter(kyc_status="approved").count(),
+        "total_traders":         Trader.objects.count(),
+        "total_copies":          CopyRelationship.objects.count(),
+        "pending_tx":            Transaction.objects.filter(status="pending").count(),
+        "completed_deposits":    Transaction.objects.filter(tx_type="deposit",    status="completed").aggregate(s=Sum("amount_usd"))["s"] or 0,
+        "completed_withdrawals": Transaction.objects.filter(tx_type="withdrawal", status="completed").aggregate(s=Sum("amount_usd"))["s"] or 0,
+        "total_balance":         User.objects.aggregate(s=Sum("balance"))["s"] or 0,
+        "total_profit":          User.objects.aggregate(s=Sum("roi"))["s"] or 0,
+        "recent_tx":             Transaction.objects.select_related("user").order_by("-created_at")[:8],
+        "recent_users":          User.objects.order_by("-date_joined")[:8],
+    })
+
+# ── Users ─────────────────────────────────────────────────────────────────────
+
+@superuser_required
+def user_list(request):
+    qs = User.objects.order_by("-date_joined")
+    q  = request.GET.get("q","").strip()
+    kf = request.GET.get("kyc","")
+    if q:  qs = qs.filter(Q(email__icontains=q)|Q(first_name__icontains=q)|Q(last_name__icontains=q))
+    if kf: qs = qs.filter(kyc_status=kf)
+    page = Paginator(qs, 25).get_page(request.GET.get("page"))
+    return render(request, "panel/users/list.html", {"page_obj": page, "q": q, "kyc_filter": kf, "kyc_choices": User.KYC_STATUS_CHOICES})
+
+
+@superuser_required
+def user_create(request):
+    form = UserCreateForm(request.POST or None)
+    if form.is_valid():
+        user = form.save()
+        messages.success(request, f"User {user.email} created.")
+        return redirect("panel:user_detail", pk=user.pk)
+    return render(request, "panel/users/create.html", {"form": form})
+
+
+@superuser_required
+def user_detail(request, pk):
+    obj = get_object_or_404(User, pk=pk)
+    copies = CopyRelationship.objects.filter(copier=obj).select_related("trader")
+    return render(request, "panel/users/detail.html", {
+        "obj": obj,
+        "transactions": Transaction.objects.filter(user=obj).order_by("-created_at")[:10],
+        "copies": copies,
+        "payment_methods": SavedPaymentMethod.objects.filter(user=obj).select_related("wallet"),
+        "wallet_connections": WalletConnection.objects.filter(user=obj),
+    })
+
+
+@superuser_required
+def user_edit(request, pk):
+    import logging as _log
+    obj  = get_object_or_404(User, pk=pk)
+    was_approved = obj.kyc_status == "approved"
+    form = UserEditForm(request.POST or None, instance=obj)
+    if form.is_valid():
+        form.save()
+        # Admins can also flip kyc_status to "approved" from this general
+        # edit form (not just the dedicated Approve KYC button) — send the
+        # same verification email, but only on the actual transition so
+        # re-saving an already-approved user doesn't re-send it.
+        if not was_approved and obj.kyc_status == "approved":
+            send_kyc_approved_email(obj)
+        messages.success(request, f"User {obj.email} updated.")
+        return redirect("panel:user_detail", pk=pk)
+    if request.method == "POST":
+        _log.getLogger(__name__).warning("user_edit errors pk=%s: %s", pk, form.errors.as_json())
+    return render(request, "panel/users/edit.html", {"form": form, "obj": obj})
+
+
+@superuser_required
+def user_delete(request, pk):
+    obj = get_object_or_404(User, pk=pk)
+    if request.method == "POST":
+        email = obj.email
+        obj.delete()
+        messages.success(request, f"User {email} deleted.")
+        return redirect("panel:user_list")
+    return render(request, "panel/confirm_delete.html", {
+        "title": "Delete user?",
+        "subtitle": obj.email,
+        "warning": "This will permanently delete the user and all their data.",
+        "cancel_url": f"/panel/users/{pk}/",
+    })
+
+
+@superuser_required
+@require_POST
+def user_toggle_transfer(request, pk):
+    obj = get_object_or_404(User, pk=pk)
+    obj.allow_transfer = not obj.allow_transfer
+    obj.save(update_fields=["allow_transfer"])
+    state = "enabled" if obj.allow_transfer else "disabled"
+    messages.success(request, f"Transfer {state} for {obj.email}.")
+    return redirect("panel:user_detail", pk=pk)
+
+
+@superuser_required
+@require_POST
+def user_approve_kyc(request, pk):
+    obj = get_object_or_404(User, pk=pk)
+    obj.kyc_status = "approved"
+    obj.kyc_reviewed_at = timezone.now()
+    obj.kyc_reject_reason = ""
+    obj.save(update_fields=["kyc_status","kyc_reviewed_at","kyc_reject_reason"])
+    Notification.objects.create(user=obj, notif_type="kyc", title="KYC Approved",
+        body="Your identity verification has been approved. You now have full access.")
+    send_kyc_approved_email(obj)
+    messages.success(request, f"KYC approved for {obj.email}.")
+    return redirect("panel:user_detail", pk=pk)
+
+
+@superuser_required
+def user_reject_kyc(request, pk):
+    obj  = get_object_or_404(User, pk=pk)
+    form = RejectKycForm(request.POST or None)
+    if form.is_valid():
+        obj.kyc_status = "rejected"
+        obj.kyc_reviewed_at = timezone.now()
+        obj.kyc_reject_reason = form.cleaned_data["reason"]
+        obj.save(update_fields=["kyc_status","kyc_reviewed_at","kyc_reject_reason"])
+        Notification.objects.create(user=obj, notif_type="kyc", title="KYC Rejected",
+            body="Your KYC was rejected. Reason: " + form.cleaned_data["reason"])
+        messages.success(request, f"KYC rejected for {obj.email}.")
+        return redirect("panel:user_detail", pk=pk)
+    return render(request, "panel/users/reject_kyc.html", {"form": form, "obj": obj})
+
+
+@superuser_required
+def user_adjust_funds(request, pk):
+    obj  = get_object_or_404(User, pk=pk)
+    form = AdjustFundsForm(request.POST or None)
+    if form.is_valid():
+        field   = form.cleaned_data["field"]
+        mode    = form.cleaned_data["mode"]
+        amount  = form.cleaned_data["amount"]
+        current = getattr(obj, field)
+        if   mode == "add":      setattr(obj, field, current + amount)
+        elif mode == "subtract": setattr(obj, field, max(Decimal("0"), current - amount))
+        else:                    setattr(obj, field, amount)
+        obj.save(update_fields=[field])
+        messages.success(request, f"{field.capitalize()} updated for {obj.email}.")
+        return redirect("panel:user_detail", pk=pk)
+    return render(request, "panel/users/adjust_funds.html", {"form": form, "obj": obj})
+
+# ── Traders ───────────────────────────────────────────────────────────────────
+
+@superuser_required
+def trader_list(request):
+    qs = Trader.objects.order_by("name")
+    q  = request.GET.get("q","").strip()
+    if q: qs = qs.filter(Q(name__icontains=q)|Q(username__icontains=q))
+    page = Paginator(qs, 25).get_page(request.GET.get("page"))
+    return render(request, "panel/traders/list.html", {"page_obj": page, "q": q})
+
+
+TRADER_COUNTRY_CHOICES = [
+    "United States", "United Kingdom", "Germany", "France", "Canada",
+    "Australia", "Singapore", "Hong Kong", "Japan", "South Korea", "India",
+    "Brazil", "Mexico", "Netherlands", "Switzerland", "Sweden", "Norway",
+    "Denmark", "Spain", "Italy", "Other",
+]
+
+
+@superuser_required
+def trader_create(request):
+    form = TraderForm(request.POST or None, request.FILES or None)
+    if form.is_valid():
+        trader = form.save()
+        seed_trader_demo_data(trader)
+        messages.success(request, f"Trader '{trader.name}' created — edit any of its detail-page data from this page.")
+        return redirect("panel:trader_detail", pk=trader.pk)
+    return render(request, "panel/traders/form.html", {
+        "form": form, "action": "Create",
+        "country_choices": TRADER_COUNTRY_CHOICES,
+    })
+
+
+@superuser_required
+def trader_detail(request, pk):
+    t = get_object_or_404(Trader, pk=pk)
+    all_rels       = CopyRelationship.objects.filter(trader=t).select_related("copier")
+    active_copiers = all_rels.filter(status="active")
+    return render(request, "panel/traders/detail.html", {
+        "obj":                t,
+        "copiers":            active_copiers,
+        "cancel_requests":    all_rels.filter(status="cancel_requested"),
+        "total_copiers_count": active_copiers.count(),
+    })
+
+
+@superuser_required
+def trader_edit(request, pk):
+    trader = get_object_or_404(Trader, pk=pk)
+    form   = TraderForm(request.POST or None, request.FILES or None, instance=trader)
+    if form.is_valid():
+        form.save()
+        messages.success(request, "Trader updated.")
+        return redirect("panel:trader_detail", pk=pk)
+    return render(request, "panel/traders/form.html", {
+        "form": form, "obj": trader, "action": "Edit",
+        "country_choices": TRADER_COUNTRY_CHOICES,
+    })
+
+
+@superuser_required
+def trader_delete(request, pk):
+    trader = get_object_or_404(Trader, pk=pk)
+    if request.method == "POST":
+        name = trader.name
+        trader.delete()
+        messages.success(request, f"Trader '{name}' deleted.")
+        return redirect("panel:trader_list")
+    return render(request, "panel/confirm_delete.html", {
+        "title": "Delete trader?",
+        "subtitle": trader.name,
+        "warning": "All related data (copiers) will be permanently removed.",
+        "cancel_url": f"/panel/traders/{pk}/",
+    })
+
+
+@superuser_required
+@require_POST
+def trader_disconnect_copier(request, pk, copier_pk):
+    rel = get_object_or_404(CopyRelationship, trader_id=pk, copier_id=copier_pk)
+    email = rel.copier.email
+    rel.delete()
+    messages.success(request, f"Disconnected {email} from trader.")
+    return redirect("panel:trader_detail", pk=pk)
+
+
+# ── Transactions (Requests: Deposits / Withdrawals / All Transactions) ────────
+
+def _transaction_list_view(request, locked_type=None):
+    """Shared list view for Deposits, Withdrawals, and All Transactions.
+
+    `locked_type` (None | "deposit" | "withdrawal") pins the tx_type filter
+    and hides the type dropdown — that's what separates the three sidebar
+    entries from each other while reusing one view/template."""
+    qs = Transaction.objects.select_related("user").order_by("-created_at")
+    q  = request.GET.get("q","").strip()
+    sf = request.GET.get("status","")
+    tf = locked_type or request.GET.get("type","")
+    if q:  qs = qs.filter(Q(user__email__icontains=q)|Q(asset__icontains=q))
+    if sf: qs = qs.filter(status=sf)
+    if tf: qs = qs.filter(tx_type=tf)
+
+    if locked_type == "deposit":
+        page_title, page_subtitle, list_url = "Deposits", "All incoming deposit requests", "panel:deposit_list"
+    elif locked_type == "withdrawal":
+        page_title, page_subtitle, list_url = "Withdrawals", "All outgoing withdrawal requests", "panel:withdrawal_list"
+    else:
+        page_title, page_subtitle, list_url = "All Transactions", "Every deposit and withdrawal", "panel:transaction_list"
+
+    page = Paginator(qs, 30).get_page(request.GET.get("page"))
+    return render(request, "panel/transactions/list.html", {
+        "page_obj": page, "q": q, "status_f": sf, "type_f": tf,
+        "status_choices": Transaction.STATUS_CHOICES, "type_choices": Transaction.TX_TYPE_CHOICES,
+        "locked_type": locked_type, "page_title": page_title,
+        "page_subtitle": page_subtitle, "list_url": list_url,
+    })
+
+
+@superuser_required
+def transaction_list(request):
+    """All Transactions — deposits and withdrawals together, freely filterable."""
+    return _transaction_list_view(request)
+
+
+@superuser_required
+def deposit_list(request):
+    """Requests > Deposits — deposits only."""
+    return _transaction_list_view(request, locked_type="deposit")
+
+
+@superuser_required
+def withdrawal_list(request):
+    """Requests > Withdrawals — withdrawals only."""
+    return _transaction_list_view(request, locked_type="withdrawal")
+
+
+@superuser_required
+def transaction_detail(request, pk):
+    obj = get_object_or_404(Transaction, pk=pk)
+    edit_form = TransactionEditForm(instance=obj)
+    return render(request, "panel/transactions/detail.html", {"obj": obj, "edit_form": edit_form})
+
+
+@superuser_required
+def transaction_edit(request, pk):
+    tx = get_object_or_404(Transaction, pk=pk)
+
+    if request.method == "GET":
+        form = TransactionEditForm(instance=tx)
+        return render(request, "panel/transactions/edit.html", {"obj": tx, "form": form})
+
+    old_amount_usd = tx.amount_usd  # captured before form validation mutates tx in place
+    data = request.POST.copy()
+    data["units"] = data.get("amount_usd", tx.units)  # units tracks the USD amount 1:1 on this platform
+    data["status"] = tx.status  # status is never editable from this form — approve/reject own that
+    form = TransactionEditForm(data, instance=tx)
+    if not form.is_valid():
+        return render(request, "panel/transactions/edit.html", {"obj": tx, "form": form})
+
+    # Withdrawal funds are reserved (deducted) the instant the request is made,
+    # so while it's still pending, changing the amount here must re-reserve the
+    # difference — otherwise what's actually deducted drifts from what the
+    # transaction says, and a later approve/reject would act on the wrong figure.
+    # Once a transaction is no longer pending (completed/rejected/cancelled),
+    # editing is purely a record correction — e.g. the admin later discovers
+    # the user actually sent/requested a different amount than what was
+    # processed. It must NOT re-touch the user's balance/ROI a second time;
+    # that already happened (or didn't) when the transaction was decided.
+    if tx.tx_type == "withdrawal" and tx.status == "pending":
+        field = "roi" if tx.withdraw_from == "roi" else "balance"
+        source_label = "Profit (ROI)" if field == "roi" else "Available Balance"
+        delta = form.cleaned_data["amount_usd"] - old_amount_usd  # +ve = needs more reserved
+        user = tx.user
+        if delta > 0:
+            available = getattr(user, field) or Decimal("0")
+            if available < delta:
+                messages.error(request, f"Can't raise the amount — {user.email} only has ${available:,.2f} left in their {source_label}.")
+                return redirect("panel:transaction_detail", pk=pk)
+        if delta != 0:
+            setattr(user, field, getattr(user, field) - delta)
+            user.save(update_fields=[field])
+
+    # Editing corrects the record — it must never itself flip the status;
+    # approve/reject are the only actions that do that.
+    form.instance.status = tx.status
+    form.save()
+    messages.success(request, "Transaction details updated.")
+    return redirect("panel:transaction_detail", pk=pk)
+
+
+@superuser_required
+@require_POST
+def transaction_approve(request, pk):
+    tx = get_object_or_404(Transaction, pk=pk)
+    if tx.status != "pending":
+        messages.error(request, "Only pending transactions can be approved.")
+        return redirect("panel:transaction_detail", pk=pk)
+    tx.status = "completed"
+    tx.save(update_fields=["status"])
+    user = tx.user
+    if tx.tx_type == "deposit":
+        user.balance += tx.amount_usd
+        user.save(update_fields=["balance"])
+        Notification.objects.create(user=user, notif_type="wallet", title="Deposit Confirmed",
+            body=f"Your deposit of ${tx.amount_usd:,.2f} ({tx.asset}) has been confirmed and added to your balance.")
+        send_user_deposit_approved_email(user, tx)
+        user.update_loyalty_tier()
+        messages.success(request, f"Deposit approved — ${tx.amount_usd:,.2f} added to {user.email}.")
+    else:
+        # Funds were already deducted from the user's balance/roi the moment
+        # they submitted the request (see core.views.WithdrawalView) — approving
+        # just confirms the withdrawal went out. It must NOT deduct a second time.
+        source = tx.withdraw_from or "balance"
+        source_label = "Profit (ROI)" if source == "roi" else "Available Balance"
+
+        Notification.objects.create(user=user, notif_type="wallet", title="Withdrawal Approved",
+            body=f"Your withdrawal of ${tx.amount_usd:,.2f} ({tx.asset}) from your {source_label} has been approved and processed.")
+        messages.success(request, f"Withdrawal approved — ${tx.amount_usd:,.2f} from {user.email}'s {source_label} sent.")
+    return redirect("panel:transaction_detail", pk=pk)
+
+
+@superuser_required
+@require_POST
+def transaction_reject(request, pk):
+    tx = get_object_or_404(Transaction, pk=pk)
+    if tx.status != "pending":
+        messages.error(request, "Only pending transactions can be rejected.")
+        return redirect("panel:transaction_detail", pk=pk)
+    form = RejectTransactionForm(request.POST)
+    note = form.cleaned_data["note"].strip() if form.is_valid() else ""
+    tx.status = "rejected"
+    tx.admin_note = note
+    tx.save(update_fields=["status", "admin_note"])
+
+    refund_note = ""
+    if tx.tx_type == "withdrawal":
+        # The funds were already deducted when the withdrawal was requested —
+        # rejecting it means it never went out, so give them back.
+        user = tx.user
+        field = "roi" if tx.withdraw_from == "roi" else "balance"
+        source_label = "Profit (ROI)" if field == "roi" else "Available Balance"
+        setattr(user, field, getattr(user, field) + tx.amount_usd)
+        user.save(update_fields=[field])
+        refund_note = f" ${tx.amount_usd:,.2f} was returned to their {source_label}."
+
+    body = (f"Your {tx.tx_type} of ${tx.amount_usd:,.2f} ({tx.asset}) was not approved: {note}" if note
+            else f"Your {tx.tx_type} of ${tx.amount_usd:,.2f} ({tx.asset}) was not approved. Please contact support.")
+    Notification.objects.create(user=tx.user, notif_type="wallet", title="Transaction Rejected", body=body + refund_note)
+    messages.warning(request, f"Transaction rejected for {tx.user.email}.{refund_note}")
+    return redirect("panel:transaction_detail", pk=pk)
+
+# ── Wallets ───────────────────────────────────────────────────────────────────
+
+@superuser_required
+def wallet_list(request):
+    return render(request, "panel/wallets/list.html", {"wallets": AdminWallet.objects.all()})
+
+
+@superuser_required
+def wallet_create(request):
+    form = AdminWalletForm(request.POST or None, request.FILES or None)
+    if form.is_valid():
+        form.save()
+        messages.success(request, "Wallet added.")
+        return redirect("panel:wallet_list")
+    return render(request, "panel/wallets/form.html", {
+        "form": form, "action": "Add", "icon_map": AdminWallet.WALLET_ICON_MAP,
+    })
+
+
+@superuser_required
+def wallet_edit(request, pk):
+    wallet = get_object_or_404(AdminWallet, pk=pk)
+    form   = AdminWalletForm(request.POST or None, request.FILES or None, instance=wallet)
+    if form.is_valid():
+        form.save()
+        messages.success(request, "Wallet updated.")
+        return redirect("panel:wallet_list")
+    return render(request, "panel/wallets/form.html", {
+        "form": form, "action": "Edit", "obj": wallet, "icon_map": AdminWallet.WALLET_ICON_MAP,
+    })
+
+
+@superuser_required
+def wallet_delete(request, pk):
+    wallet = get_object_or_404(AdminWallet, pk=pk)
+    if request.method == "POST":
+        wallet.delete()
+        messages.success(request, "Wallet deleted.")
+        return redirect("panel:wallet_list")
+    return render(request, "panel/confirm_delete.html", {
+        "title": "Delete wallet?",
+        "subtitle": wallet.get_name_display(),
+        "warning": "This wallet will no longer be available for deposits.",
+        "cancel_url": "/panel/wallets/",
+    })
+
+# ── Copy Trades ───────────────────────────────────────────────────────────────
+
+@superuser_required
+def copy_trade_list(request):
+    qs  = CopyRelationship.objects.select_related("copier", "trader").order_by("-started_at")
+    sf  = request.GET.get("status", "")
+    q   = request.GET.get("q", "").strip()
+    if sf: qs = qs.filter(status=sf)
+    if q:  qs = qs.filter(Q(copier__email__icontains=q) | Q(trader__name__icontains=q))
+    page = Paginator(qs, 30).get_page(request.GET.get("page"))
+    return render(request, "panel/copy_trades/list.html", {
+        "page_obj": page, "q": q, "status_f": sf,
+        "status_choices": CopyRelationship.STATUS_CHOICES,
+    })
+
+
+@superuser_required
+@require_POST
+def copy_trade_approve_cancel(request, pk):
+    """Admin approves a cancel request — relationship is deleted."""
+    rel = get_object_or_404(CopyRelationship, pk=pk, status="cancel_requested")
+    user = rel.copier
+    trader_name = rel.trader.name
+    rel.delete()
+    Notification.objects.create(
+        user=user, notif_type="trade", title="Copy Cancelled",
+        body=f"Your request to stop copying {trader_name} has been approved.",
+    )
+    messages.success(request, f"Cancel approved — {user.email} disconnected from {trader_name}.")
+    return redirect(request.META.get("HTTP_REFERER", "panel:copy_trade_list"))
+
+
+@superuser_required
+@require_POST
+def copy_trade_reject_cancel(request, pk):
+    """Admin rejects a cancel request — relationship reverts to active."""
+    rel = get_object_or_404(CopyRelationship, pk=pk, status="cancel_requested")
+    rel.status = "active"
+    rel.save(update_fields=["status"])
+    Notification.objects.create(
+        user=rel.copier, notif_type="trade", title="Cancel Request Rejected",
+        body=f"Your request to stop copying {rel.trader.name} has been reviewed and rejected. You are still copying this trader.",
+    )
+    messages.warning(request, f"Cancel request rejected — {rel.copier.email} remains active on {rel.trader.name}.")
+    return redirect(request.META.get("HTTP_REFERER", "panel:copy_trade_list"))
+
+
+# ── Investors ─────────────────────────────────────────────────────────────────
+
+@superuser_required
+def investor_list(request):
+    """Users with a positive balance — i.e. everyone eligible to have a trade run for them."""
+    q = request.GET.get("q", "").strip()
+    qs = User.objects.filter(balance__gt=0).annotate(
+        trader_count=Count("copying", distinct=True),
+        active_count=Count("copying", filter=Q(copying__status="active"), distinct=True),
+        cancel_count=Count("copying", filter=Q(copying__status="cancel_requested"), distinct=True),
+    ).order_by("-balance").prefetch_related("copying__trader")
+    if q:
+        qs = qs.filter(Q(email__icontains=q) | Q(first_name__icontains=q) | Q(last_name__icontains=q))
+    page = Paginator(qs, 30).get_page(request.GET.get("page"))
+    return render(request, "panel/investors/list.html", {"page_obj": page, "q": q})
+
+
+@superuser_required
+def panel_fmp_search(request):
+    """Return JSON list of {symbol, name} from FMP symbol search."""
+    q = request.GET.get("q", "").strip()
+    if not q or len(q) < 1:
+        return JsonResponse([], safe=False)
+    results = search_symbols(q, limit=20)
+    return JsonResponse(results, safe=False)
+
+
+def _apply_trade(user, cd):
+    """Create a CopyTrade and update the user's roi/percentage_roi."""
+    balance     = user.balance or Decimal("0")
+    earning_pct = cd["earning_pct"]
+    pnl_amount  = (balance * earning_pct / Decimal("100")).quantize(Decimal("0.01"))
+
+    user.roi            = (user.roi            or Decimal("0")) + pnl_amount
+    user.percentage_roi = (user.percentage_roi or Decimal("0")) + earning_pct
+    user.save(update_fields=["roi", "percentage_roi"])
+
+    asset = cd["asset"]
+    _crypto_syms = set(ASSET_MAP.get("crypto", []))
+    _forex_syms  = set(ASSET_MAP.get("forex",  []))
+    # Known lists first; then pattern-match for FMP assets not in the local map
+    if asset in _crypto_syms:
+        inferred_type = "crypto"
+    elif asset in _forex_syms or "/" in asset:
+        inferred_type = "forex"
+    else:
+        inferred_type = "stock"
+    return CopyTrade.objects.create(
+        user        = user,
+        asset       = asset,
+        asset_type  = inferred_type,
+        asset_logo  = f"https://images.financialmodelingprep.com/symbol/{asset}.png",
+        direction   = cd["direction"],
+        entry       = cd["entry"],
+        earning_pct = earning_pct,
+        pnl         = pnl_amount,
+        duration    = cd["duration"],
+        status      = cd["status"],
+        created_at  = cd.get("created_at") or timezone.now(),
+    )
+
+
+@superuser_required
+def investor_add_trade(request, user_pk):
+    """Add a CopyTrade for a specific user."""
+    user   = get_object_or_404(User, pk=user_pk)
+    form   = AddTradeForm(request.POST or None)
+    trades = CopyTrade.objects.filter(user=user).select_related("trader").order_by("-created_at")
+    if form.is_valid():
+        trade = _apply_trade(user, form.cleaned_data)
+        Notification.objects.create(
+            user=user, notif_type="trade", title="New Trade",
+            body=f"A new {trade.direction} trade on {trade.asset} has been added to your copy portfolio.",
+        )
+        messages.success(request, f"Trade added for {user.email}.")
+        return redirect("panel:investor_add_trade", user_pk=user_pk)
+    return render(request, "panel/investors/add_trade.html", {
+        "form": form,
+        "inv_user": user,
+        "trades": trades,
+        "asset_icon_map": ASSET_ICON_MAP,
+    })
+
+
+@superuser_required
+def investor_bulk_add_trade(request):
+    """Bulk add a trade to multiple selected users."""
+    user_ids = request.POST.getlist("user_ids") or request.GET.getlist("user_ids")
+    users    = User.objects.filter(pk__in=user_ids) if user_ids else User.objects.none()
+
+    if not user_ids:
+        messages.error(request, "No investors selected.")
+        return redirect("panel:investor_list")
+
+    all_trades = CopyTrade.objects.select_related("user", "trader").order_by("-created_at")
+
+    form = AddTradeForm(request.POST if request.method == "POST" and "asset" in request.POST else None)
+    if form.is_valid():
+        count = 0
+        for user in users:
+            trade = _apply_trade(user, form.cleaned_data)
+            Notification.objects.create(
+                user=user, notif_type="trade", title="New Trade",
+                body=f"A new {trade.direction} trade on {trade.asset} has been added to your copy portfolio.",
+            )
+            count += 1
+        messages.success(request, f"Trade added to {count} investor(s).")
+        return redirect(request.get_full_path())
+
+    return render(request, "panel/investors/bulk_add_trade.html", {
+        "form": form,
+        "users": users,
+        "user_ids": user_ids,
+        "all_trades": all_trades,
+        "asset_icon_map": ASSET_ICON_MAP,
+    })
+
+
+@superuser_required
+def all_trade_records(request):
+    """List all injected CopyTrade records across all users."""
+    qs = CopyTrade.objects.select_related("user", "trader").order_by("-created_at")
+
+    q  = request.GET.get("q",      "").strip()
+    sf = request.GET.get("status", "").strip()
+    tf = request.GET.get("type",   "").strip()
+
+    if q:  qs = qs.filter(Q(user__email__icontains=q) | Q(asset__icontains=q))
+    if sf: qs = qs.filter(status=sf)
+    if tf: qs = qs.filter(asset_type=tf)
+
+    page = Paginator(qs, 30).get_page(request.GET.get("page"))
+    return render(request, "panel/investors/all_trades.html", {
+        "page_obj":      page,
+        "q":             q,
+        "status_f":      sf,
+        "type_f":        tf,
+        "asset_icon_map": ASSET_ICON_MAP,
+        "status_choices": CopyTrade.STATUS_CHOICES,
+        "type_choices":   CopyTrade.TYPE_CHOICES,
+    })
+
+
+@superuser_required
+def copy_trade_record_edit(request, pk):
+    """Edit an individual CopyTrade record."""
+    trade = get_object_or_404(CopyTrade, pk=pk)
+    form  = EditCopyTradeForm(request.POST or None, instance=trade)
+    if form.is_valid():
+        form.save()
+        messages.success(request, f"Trade #{trade.pk} updated.")
+        # Return to the page we came from (add_trade for single, bulk for all)
+        referer = request.META.get("HTTP_REFERER", "")
+        if "bulk" in referer:
+            return redirect(referer)
+        return redirect("panel:investor_add_trade", user_pk=trade.user_id)
+    return render(request, "panel/investors/edit_trade.html", {
+        "form":  form,
+        "trade": trade,
+        "asset_map_json": json.dumps(ASSET_MAP),
+    })
+
+
+@superuser_required
+@require_POST
+def copy_trade_record_delete(request, pk):
+    """Delete an individual CopyTrade record."""
+    trade   = get_object_or_404(CopyTrade, pk=pk)
+    user_pk = trade.user_id
+    referer = request.META.get("HTTP_REFERER", "")
+    trade.delete()
+    messages.success(request, f"Trade #{pk} deleted.")
+    if "bulk" in referer:
+        return redirect(referer)
+    return redirect("panel:investor_add_trade", user_pk=user_pk)
+
+
+# ── Custom / bulk client emails ─────────────────────────────────────────────
+
+@superuser_required
+def custom_email_list(request):
+    """Pick recipients for a custom email — checkbox selection, same pattern as investors."""
+    qs = User.objects.order_by("-date_joined")
+    q  = request.GET.get("q", "").strip()
+    if q:
+        qs = qs.filter(Q(email__icontains=q) | Q(first_name__icontains=q) | Q(last_name__icontains=q))
+    page = Paginator(qs, 25).get_page(request.GET.get("page"))
+    return render(request, "panel/emails/list.html", {"page_obj": page, "q": q})
+
+
+@superuser_required
+def custom_email_compose(request):
+    """
+    Stage 1 (POST with only user_ids): show the compose form for the selected recipients.
+    Stage 2 (POST with subject/message): validate + send to every selected recipient.
+    """
+    user_ids = request.POST.getlist("user_ids") or request.GET.getlist("user_ids")
+    users    = User.objects.filter(pk__in=user_ids) if user_ids else User.objects.none()
+
+    if not user_ids:
+        messages.error(request, "No recipients selected.")
+        return redirect("panel:custom_email_list")
+
+    form = CustomEmailForm(request.POST if request.method == "POST" and "subject" in request.POST else None)
+    if form.is_valid():
+        cd           = form.cleaned_data
+        social_links = form.social_links()
+
+        campaign = EmailCampaign.objects.create(
+            subject=cd["subject"],
+            heading=cd.get("heading", ""),
+            message=cd["message"],
+            cta_text=cd.get("cta_text", ""),
+            cta_url=cd.get("cta_url", ""),
+            social_links=social_links,
+            recipient_count=users.count(),
+            sent_by=request.user,
+        )
+
+        results = send_custom_email_batch(
+            users,
+            subject=cd["subject"],
+            message=cd["message"],
+            heading=cd.get("heading", ""),
+            social_links=social_links,
+            cta_text=cd.get("cta_text", ""),
+            cta_url=cd.get("cta_url", ""),
+        )
+
+        sent = failed = 0
+        recipient_rows = []
+        for recipient in users:
+            ok = results.get(recipient.id, False)
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+            recipient_rows.append(EmailCampaignRecipient(
+                campaign=campaign,
+                user=recipient,
+                email=recipient.email,
+                name=f"{recipient.first_name} {recipient.last_name}".strip(),
+                status="sent" if ok else "failed",
+            ))
+        EmailCampaignRecipient.objects.bulk_create(recipient_rows)
+
+        campaign.sent_count   = sent
+        campaign.failed_count = failed
+        campaign.save(update_fields=["sent_count", "failed_count"])
+
+        if failed:
+            messages.warning(request, f"Email sent to {sent} of {users.count()} recipient(s) — {failed} failed. See details below.")
+        else:
+            messages.success(request, f"Email sent to {sent} recipient(s).")
+        return redirect("panel:custom_email_detail", pk=campaign.pk)
+
+    return render(request, "panel/emails/compose.html", {
+        "form": form, "users": users, "user_ids": user_ids,
+    })
+
+
+@superuser_required
+def custom_email_history(request):
+    """Log of previously sent custom email campaigns."""
+    qs   = EmailCampaign.objects.select_related("sent_by").order_by("-created_at")
+    page = Paginator(qs, 25).get_page(request.GET.get("page"))
+    return render(request, "panel/emails/history.html", {"page_obj": page})
+
+
+@superuser_required
+def custom_email_detail(request, pk):
+    """Full details of a sent campaign: content, live HTML preview, and per-recipient status."""
+    campaign        = get_object_or_404(EmailCampaign.objects.select_related("sent_by"), pk=pk)
+    has_recipients  = campaign.recipients.exists()
+    recipients_qs   = campaign.recipients.order_by("email")
+    status_f        = request.GET.get("status", "").strip()
+    if status_f in ("sent", "failed"):
+        recipients_qs = recipients_qs.filter(status=status_f)
+    page = Paginator(recipients_qs, 50).get_page(request.GET.get("page"))
+
+    preview_html = render_custom_email_preview(
+        message=campaign.message,
+        heading=campaign.heading,
+        social_links=campaign.social_links,
+        cta_text=campaign.cta_text,
+        cta_url=campaign.cta_url,
+    )
+
+    return render(request, "panel/emails/detail.html", {
+        "campaign":       campaign,
+        "page_obj":       page,
+        "status_f":       status_f,
+        "preview_html":   preview_html,
+        "has_recipients": has_recipients,
+    })
+
+
+@superuser_required
+def custom_email_delete(request, pk):
+    """Delete a campaign record (and its recipient rows) from Email History.
+    Does not un-send anything — this only removes the log entry."""
+    campaign = get_object_or_404(EmailCampaign, pk=pk)
+    if request.method == "POST":
+        subject = campaign.subject
+        campaign.delete()
+        messages.success(request, f"Deleted email record '{subject}'.")
+        return redirect("panel:custom_email_history")
+    return render(request, "panel/confirm_delete.html", {
+        "title": "Delete this email record?",
+        "subtitle": campaign.subject,
+        "warning": "This only removes the log entry — it does not un-send the email or notify recipients.",
+        "cancel_url": "/panel/emails/history/",
+    })
+
+
+# ── Signals (Trading Signals) ───────────────────────────────────────────────
+
+@superuser_required
+def signal_list(request):
+    qs = Signal.objects.order_by("-created_at")
+    q  = request.GET.get("q", "").strip()
+    sf = request.GET.get("status", "")
+    if q:  qs = qs.filter(Q(name__icontains=q))
+    if sf: qs = qs.filter(status=sf)
+    page = Paginator(qs, 25).get_page(request.GET.get("page"))
+    return render(request, "panel/signals/list.html", {
+        "page_obj": page, "q": q, "status_f": sf,
+        "status_choices": Signal.SIGNAL_STATUS,
+        "total_count": Signal.objects.count(),
+        "active_count": Signal.objects.filter(is_active=True).count(),
+    })
+
+
+@superuser_required
+def signal_create(request):
+    form = SignalForm(request.POST or None)
+    if form.is_valid():
+        signal = form.save()
+        messages.success(request, f"Signal '{signal.name}' created.")
+        return redirect("panel:signal_detail", pk=signal.pk)
+    return render(request, "panel/signals/form.html", {"form": form, "action": "Add"})
+
+
+@superuser_required
+def signal_detail(request, pk):
+    return render(request, "panel/signals/detail.html", {"obj": get_object_or_404(Signal, pk=pk)})
+
+
+@superuser_required
+def signal_edit(request, pk):
+    signal = get_object_or_404(Signal, pk=pk)
+    form   = SignalForm(request.POST or None, instance=signal)
+    if form.is_valid():
+        form.save()
+        messages.success(request, "Signal updated.")
+        return redirect("panel:signal_detail", pk=pk)
+    return render(request, "panel/signals/form.html", {"form": form, "obj": signal, "action": "Edit"})
+
+
+@superuser_required
+def signal_delete(request, pk):
+    signal = get_object_or_404(Signal, pk=pk)
+    if request.method == "POST":
+        name = signal.name
+        signal.delete()
+        messages.success(request, f"Signal '{name}' deleted.")
+        return redirect("panel:signal_list")
+    return render(request, "panel/confirm_delete.html", {
+        "title": "Delete signal?",
+        "subtitle": signal.name,
+        "warning": "This signal will no longer be available to users.",
+        "cancel_url": f"/panel/signals/{pk}/",
+    })
+
+
+# ── User Cards ───────────────────────────────────────────────────────────────
+
+@superuser_required
+def card_list(request):
+    qs = Card.objects.select_related("user").order_by("-created_at")
+    q  = request.GET.get("q", "").strip()
+    if q:
+        qs = qs.filter(
+            Q(user__email__icontains=q) | Q(cardholder_name__icontains=q) | Q(card_number__endswith=q)
+        )
+    page = Paginator(qs, 25).get_page(request.GET.get("page"))
+    return render(request, "panel/cards/list.html", {"page_obj": page, "q": q})
+
+
+@superuser_required
+def card_detail(request, pk):
+    return render(request, "panel/cards/detail.html", {"obj": get_object_or_404(Card.objects.select_related("user"), pk=pk)})
+
+
+@superuser_required
+def card_edit(request, pk):
+    card = get_object_or_404(Card, pk=pk)
+    form = CardEditForm(request.POST or None, instance=card)
+    if form.is_valid():
+        form.save()
+        messages.success(request, f"Card #{card.pk} updated.")
+        return redirect("panel:card_detail", pk=pk)
+    return render(request, "panel/cards/form.html", {"form": form, "obj": card})
+
+
+@superuser_required
+def card_delete(request, pk):
+    card = get_object_or_404(Card, pk=pk)
+    if request.method == "POST":
+        card.delete()
+        messages.success(request, f"Card #{pk} deleted.")
+        return redirect("panel:card_list")
+    return render(request, "panel/confirm_delete.html", {
+        "title": "Delete card?",
+        "subtitle": f"{card.user.email} — {card.masked_number}",
+        "warning": "This card record will be permanently deleted.",
+        "cancel_url": f"/panel/cards/{pk}/",
+    })
+
+
+# ── Notifications ────────────────────────────────────────────────────────────
+
+@superuser_required
+def notification_list(request):
+    qs = Notification.objects.select_related("user").order_by("-created_at")
+    q  = request.GET.get("q", "").strip()
+    tf = request.GET.get("type", "")
+    if q:  qs = qs.filter(Q(title__icontains=q) | Q(user__email__icontains=q) | Q(body__icontains=q))
+    if tf: qs = qs.filter(notif_type=tf)
+    page = Paginator(qs, 25).get_page(request.GET.get("page"))
+    return render(request, "panel/notifications/list.html", {
+        "page_obj": page, "q": q, "type_f": tf,
+        "type_choices": Notification.TYPE_CHOICES,
+        "total_count": Notification.objects.count(),
+        "unread_count": Notification.objects.filter(is_read=False).count(),
+    })
+
+
+@superuser_required
+def notification_create(request):
+    form = NotificationForm(request.POST or None)
+    if form.is_valid():
+        cd     = form.cleaned_data
+        target = cd["target"]
+        users  = User.objects.filter(is_active=True) if target == "all" else [cd["user"]]
+        count  = 0
+        for u in users:
+            Notification.objects.create(user=u, notif_type=cd["notif_type"], title=cd["title"], body=cd["body"])
+            count += 1
+        label = "all users" if target == "all" else cd["user"].email
+        messages.success(request, f"Notification sent to {label} ({count} recipient{'s' if count != 1 else ''}).")
+        return redirect("panel:notification_list")
+    return render(request, "panel/notifications/form.html", {"form": form, "action": "Add"})
+
+
+@superuser_required
+def notification_edit(request, pk):
+    notification = get_object_or_404(Notification, pk=pk)
+    if request.method == "POST":
+        notification.notif_type = request.POST.get("notif_type", notification.notif_type)
+        notification.title      = request.POST.get("title", notification.title).strip()
+        notification.body       = request.POST.get("body", notification.body).strip()
+        if not notification.title or not notification.body:
+            messages.error(request, "Title and body are required.")
+        else:
+            notification.save(update_fields=["notif_type", "title", "body"])
+            messages.success(request, "Notification updated.")
+            return redirect("panel:notification_list")
+    return render(request, "panel/notifications/edit.html", {
+        "obj": notification, "type_choices": Notification.TYPE_CHOICES,
+    })
+
+
+@superuser_required
+def notification_delete(request, pk):
+    notification = get_object_or_404(Notification, pk=pk)
+    if request.method == "POST":
+        notification.delete()
+        messages.success(request, "Notification deleted.")
+        return redirect("panel:notification_list")
+    return render(request, "panel/confirm_delete.html", {
+        "title": "Delete notification?",
+        "subtitle": notification.title,
+        "warning": "This will permanently remove the notification.",
+        "cancel_url": "/panel/notifications/",
+    })
+
+
+# ── Settings: Wallet Connections (users' linked external wallets) ──────────
+
+@superuser_required
+def wallet_connection_list(request):
+    qs = WalletConnection.objects.select_related("user").order_by("-connected_at")
+    q  = request.GET.get("q", "").strip()
+    tf = request.GET.get("type", "")
+    sf = request.GET.get("status", "")
+    if q:
+        qs = qs.filter(
+            Q(user__email__icontains=q) | Q(wallet_name__icontains=q) | Q(wallet_address__icontains=q)
+        )
+    if tf: qs = qs.filter(wallet_type=tf)
+    if sf == "active":   qs = qs.filter(is_active=True)
+    elif sf == "inactive": qs = qs.filter(is_active=False)
+    page = Paginator(qs, 25).get_page(request.GET.get("page"))
+    return render(request, "panel/wallet_connections/list.html", {
+        "page_obj": page, "q": q, "type_f": tf, "status_f": sf,
+        "wallet_types": WalletConnection.WALLET_TYPES,
+        "total_count": WalletConnection.objects.count(),
+        "active_count": WalletConnection.objects.filter(is_active=True).count(),
+    })
+
+
+@superuser_required
+def wallet_connection_detail(request, pk):
+    obj = get_object_or_404(WalletConnection.objects.select_related("user"), pk=pk)
+    return render(request, "panel/wallet_connections/detail.html", {"obj": obj})
+
+
+@superuser_required
+def wallet_connection_edit(request, pk):
+    obj  = get_object_or_404(WalletConnection.objects.select_related("user"), pk=pk)
+    form = WalletConnectionForm(request.POST or None, instance=obj)
+    if form.is_valid():
+        form.save()
+        messages.success(request, f"Wallet connection for {obj.user.email} updated.")
+        return redirect("panel:wallet_connection_detail", pk=pk)
+    return render(request, "panel/wallet_connections/form.html", {"form": form, "obj": obj})
+
+
+@superuser_required
+def wallet_connection_delete(request, pk):
+    obj = get_object_or_404(WalletConnection.objects.select_related("user"), pk=pk)
+    if request.method == "POST":
+        email, name = obj.user.email, obj.wallet_name
+        obj.delete()
+        messages.success(request, f"Wallet connection '{name}' for {email} deleted.")
+        return redirect("panel:wallet_connection_list")
+    return render(request, "panel/confirm_delete.html", {
+        "title": "Delete wallet connection?",
+        "subtitle": f"{obj.wallet_name} — {obj.user.email}",
+        "warning": "The user will need to reconnect this wallet from their dashboard if they want it back.",
+        "cancel_url": f"/panel/wallet-connections/{pk}/",
+    })
+
+
+# ── Settings: Change User Password ──────────────────────────────────────────
+
+@superuser_required
+def change_user_password(request):
+    form = SetUserPasswordForm(request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        user = form.cleaned_data["user"]
+        plain = form.cleaned_data["new_password"]
+        user.set_password(plain)
+        user.password_plaintext = plain
+        user.save()
+        messages.success(request, f"Password for {user.email} has been changed successfully.")
+        return redirect("panel:change_user_password")
+    return render(request, "panel/users/change_password.html", {"form": form})

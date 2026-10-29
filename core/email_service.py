@@ -846,8 +846,8 @@ def _admin_header(title, subtitle="", preheader=""):
                       <tr>
                         <td style="background-color:{_ADMIN_BRAND}; border-radius:6px; width:8px; height:28px;">&nbsp;</td>
                         <td style="padding-left:10px; vertical-align:middle;">
-                          <span style="font-size:18px; font-weight:700; color:#ffffff; letter-spacing:-0.3px;">HAGO</span>
-                          <span style="font-size:18px; font-weight:300; color:{_ADMIN_BRAND}; letter-spacing:-0.3px;">&nbsp;CAPITALS</span>
+                          <span style="font-size:18px; font-weight:700; color:#ffffff; letter-spacing:-0.3px;">CAPLINK</span>
+                          <span style="font-size:18px; font-weight:300; color:{_ADMIN_BRAND}; letter-spacing:-0.3px;">&nbsp;MARKETS</span>
                           <span style="font-size:11px; font-weight:500; color:#6b7280; letter-spacing:2px; display:block; margin-top:1px;">COPY TRADING PLATFORM</span>
                         </td>
                       </tr>

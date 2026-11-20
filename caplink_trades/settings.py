@@ -280,6 +280,7 @@ DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='CapLink Markets <supp
 ADMIN_NOTIFICATION_EMAIL = config('ADMIN_NOTIFICATION_EMAIL', default='support@caplinktrade.com')
 RESEND_API_KEY = config('RESEND_API_KEY', default='')
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:3000")
+TURNSTILE_SECRET_KEY = config('TURNSTILE_SECRET_KEY', default='')
 
 
 
